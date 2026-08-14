@@ -3,6 +3,7 @@
 #
 # 用法:
 #   dsh-hmos install        安装/修复 dsh 及全部依赖(幂等,可重复执行)
+#   dsh-hmos reinstall      强制重装 dsh 并重建原生模块(升级 dsh 后使用)
 #   dsh-hmos uninstall      卸载 dsh 及脚本状态(保留 ~/.dsh 用户数据)
 #   dsh-hmos start [flags]  后台启动 dsh web,flags 原样透传给 dsh web
 #                           (如 --port 8080 / --host 0.0.0.0 / --trusted-host ...);
@@ -20,6 +21,7 @@
 #     3) dsh-credentials-local: openharmony 平台跳过 0600 权限检查(chmod 无效)
 #     4) @vscode/ripgrep: openharmony 无平台包,回退到 harmonybrew 的 ripgrep
 # - 依赖: node ohos-sdk cmake make ninja python@3.14 ripgrep(通过 brew 安装)
+# - 非 HarmonyOS 系统运行本脚本会给出警告(避免误操作破坏其他环境)
 set -euo pipefail
 
 BREW_PREFIX="$HOME/.harmonybrew"
@@ -36,6 +38,15 @@ log() { echo "[dsh-hmos] $*"; }
 die() { echo "[dsh-hmos] 错误: $*" >&2; exit 1; }
 
 # ---------- 基础环境 ----------
+
+# 非 HarmonyOS 环境给出警告但不阻止(避免误操作破坏其他系统)
+check_platform() {
+    case "$(uname -s 2>/dev/null)" in
+        HarmonyOS*|OpenHarmony*|openharmony*) : ;;
+        *) echo "[dsh-hmos] 警告: 当前系统是 '$(uname -s 2>/dev/null)',不是 HarmonyOS;" >&2
+           echo "[dsh-hmos]        本脚本的 patch 针对 HarmonyOS/hmdfs,在其他系统上执行可能破坏环境" >&2 ;;
+    esac
+}
 
 ensure_brew() {
     if ! command -v brew >/dev/null 2>&1 && [ ! -x "$BREW_BIN" ]; then
@@ -55,23 +66,29 @@ ensure_installed() {
 
 cmd_install() {
     ensure_brew
+    mkdir -p "$STATE_DIR"
 
     # 1. 系统依赖
     log "检查/安装依赖: node ohos-sdk cmake make ninja python@3.14 ripgrep ..."
-    brew install node ohos-sdk cmake make ninja python@3.14 ripgrep 2>&1 | tail -3 || die "brew install 失败"
+    if ! brew install node ohos-sdk cmake make ninja python@3.14 ripgrep >"$STATE_DIR/brew-install.log" 2>&1; then
+        tail -20 "$STATE_DIR/brew-install.log" >&2 || true
+        die "brew install 失败(完整日志: $STATE_DIR/brew-install.log)"
+    fi
     command -v clang >/dev/null 2>&1 || die "ohos-sdk 未提供 clang,请检查安装"
     command -v python3 >/dev/null 2>&1 || die "python3 不可用,请检查 python@3.14 安装"
 
     # 2. dsh 本体(跳过构建脚本,后续手动构建原生模块)
-    if command -v dsh >/dev/null 2>&1; then
-        log "dsh 已安装: $(dsh --version 2>/dev/null || echo '?')"
-    else
-        log "安装 @deepseek-ai/dsh (npm, npmmirror 镜像)..."
+    #    FORCE=1(reinstall): 无条件重装,用于升级 dsh 后重打补丁/重建原生模块
+    if [ "${FORCE:-0}" = 1 ] || [ ! -x "$DSH_BIN" ]; then
+        log "安装/重装 @deepseek-ai/dsh (npm, npmmirror 镜像)..."
         npm install -g @deepseek-ai/dsh --ignore-scripts --registry="$REGISTRY" || die "npm 安装 dsh 失败"
+        # npm 会重建 node_modules,旧原生产物与旧 patch 全部作废
+        rm -rf "$DSH_PKG/node_modules/koffi/build" "$DSH_PKG/node_modules/node-pty/build"
+    else
+        log "dsh 已安装: $(dsh --version 2>/dev/null || echo '?')"
     fi
 
     # 3. 生成 koffi 构建用 toolchain 文件
-    mkdir -p "$STATE_DIR"
     cat > "$TOOLCHAIN_FILE" <<'EOF'
 # Force cmake to treat HarmonyOS as Linux/aarch64 (cmake does not know
 # HarmonyOS: CMAKE_SYSTEM_PROCESSOR is "unknown", which breaks koffi's
@@ -92,7 +109,20 @@ EOF
     build_koffi
     install_sharp_wasm
 
+    # 6. 原生模块加载自检(快速失败,避免带病运行)
+    verify_install
+
     log "安装/修复完成。启动: dsh-hmos start"
+}
+
+# install/reinstall 末尾自检: 原生模块可加载 + ripgrep 解析正确
+verify_install() {
+    log "自检: node-pty / koffi / sharp 加载与 ripgrep 解析..."
+    ( cd "$DSH_PKG" && node -e "require('node-pty'); require('koffi'); require('sharp'); console.log('[dsh-hmos] 原生模块加载 OK')" ) \
+        || die "原生模块加载自检失败,请重新运行 dsh-hmos install 并查看错误"
+    ( cd "$DSH_PKG" && node --input-type=module -e \
+        "import('@vscode/ripgrep').then(m => console.log('[dsh-hmos] rgPath:', m.rgPath)).catch(e => { console.error(e.message); process.exit(1) })" ) \
+        || die "ripgrep 解析自检失败"
 }
 
 # koffi: 禁用 POST_BUILD strip(hmdfs 的 dlopen 拒绝 stripped .node)
@@ -122,6 +152,10 @@ block = ('if(CMAKE_BUILD_TYPE STREQUAL "Release")\n'
 open(f, 'w').write(src[:start] + block + src[end:])
 print("patched")
 PYEOF
+    # 关键: 清空已有 build 目录。若此前用未 patch 的 CMakeLists 构建过
+    # (stripped 产物,加载必失败),build_koffi 的"产物存在即跳过"会跳过重建,
+    # 导致补丁形同虚设。README 第 4.2 节同样要求 rm -rf build 后完整重建。
+    rm -rf "$DSH_PKG/node_modules/koffi/build"
 }
 
 # 会话保存: hmdfs 不支持硬链接, link -> rename
@@ -302,9 +336,9 @@ cmd_start() {
     fi
     rm -f "$pid_file"
 
-    # 3) 启动
+    # 3) 启动(权限模式允许用户用环境变量覆盖,默认 danger-full-access)
     log "后台启动 dsh web (port $port): dsh web $*"
-    export DSH_PERMISSION_MODE="danger-full-access"
+    export DSH_PERMISSION_MODE="${DSH_PERMISSION_MODE:-danger-full-access}"
     nohup node --expose-internals "$DSH_BIN" web "$@" >>"$log_file" 2>&1 &
     echo $! > "$pid_file"
 
@@ -362,6 +396,9 @@ cmd_stop() {
         esac
         prev="$i"
     done
+    case "$only_port" in
+        ''|*[!0-9]*) die "无效端口: '$only_port'(应为纯数字,如 --port 8080)";;
+    esac
 
     local stopped=0
     if [ -d "$STATE_DIR" ]; then
@@ -413,7 +450,7 @@ cmd_uninstall() {
     ensure_brew
     # 先停掉正在运行的服务
     cmd_stop 2>/dev/null || true
-    if command -v dsh >/dev/null 2>&1; then
+    if [ -x "$DSH_BIN" ]; then
         log "卸载 @deepseek-ai/dsh (npm)..."
         npm uninstall -g @deepseek-ai/dsh 2>&1 | tail -3 || die "npm uninstall 失败"
         log "dsh 已卸载"
@@ -428,14 +465,23 @@ cmd_uninstall() {
     log "卸载完成。~/.dsh(会话/凭据/配置)已保留;如需彻底清除请手动删除 ~/.dsh"
 }
 
+# 强制重装: 升级 dsh 后 node_modules 被替换,4 处 patch 与原生模块产物全部作废,
+# 需 npm 重装 + 重新打 patch + 重建原生模块(与 install 流程相同,但强制刷新)
+cmd_reinstall() {
+    FORCE=1 cmd_install "$@"
+}
+
 # ---------- main ----------
 
 usage() {
-    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
 }
+
+check_platform
 
 case "${1:-help}" in
     install) shift; cmd_install "$@";;
+    reinstall) shift; cmd_reinstall "$@";;
     uninstall) shift; cmd_uninstall "$@";;
     start)   shift; cmd_start "$@";;
     status)  cmd_status "$@";;

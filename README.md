@@ -18,6 +18,7 @@
 
 ```bash
 dsh-hmos install      # 检查 brew -> 安装依赖 -> 安装 dsh -> 打 HarmonyOS patch -> 构建原生模块(幂等)
+dsh-hmos reinstall    # 升级 dsh 后使用:npm 重装 + 重打 4 处 patch + 重建原生模块(强制刷新)
 dsh-hmos uninstall    # 卸载 dsh 及脚本状态(保留 ~/.dsh 用户数据)
 dsh-hmos start [flags]  # 后台启动 dsh web;flags 原样透传给 dsh web
 dsh-hmos status       # 查看所有后台实例运行状态
@@ -49,8 +50,10 @@ PID/日志文件(`~/.dsh-hmos/web-<port>.{pid,log}`);`status` 列出全部,
 
 `install` 在 brew 未安装时会提示访问 https://harmonybrew.atomgit.com 并退出;
 已安装则自动完成依赖(node ohos-sdk cmake make ninja python@3.14 ripgrep)、npm 安装
-`@deepseek-ai/dsh`、四处 HarmonyOS 必需 patch(见下文第 3.2、6、7、9 节)以及
-node-pty / koffi / sharp 原生模块构建。重复执行安全(幂等)。
+`@deepseek-ai/dsh`、四处 HarmonyOS 必需 patch(见下文第 4.2、7、8、10 节)以及
+node-pty / koffi / sharp 原生模块构建,最后做原生模块加载自检。重复执行安全(幂等)。
+**升级 dsh 后**(npm install -g 新版本)4 处 patch 与原生模块产物都会被覆盖,
+必须运行 `dsh-hmos reinstall`(强制 npm 重装 + 重打 patch + 重建 node-pty/koffi)。
 `uninstall` 会先停服务、卸载 npm 包并清理脚本状态目录(`~/.dsh-hmos`),
 **保留** `~/.dsh`(会话/凭据/配置);彻底清除需手动删除 `~/.dsh`。
 
@@ -66,7 +69,7 @@ node-pty / koffi / sharp 原生模块构建。重复执行安全(幂等)。
 | `make` | `brew install make` | node-pty 构建(node-gyp 使用 make) | 本机实测必要,勿漏 |
 | `ninja` | `brew install ninja` | koffi 的 cmake 生成器 | |
 | `python@3.14` | `brew install python@3.14` | node-pty 构建(node-gyp 需要 Python) | 装完后 `python3` 在 `~/.harmonybrew/bin/python3` |
-| `ripgrep` | `brew install ripgrep` | dsh 文件搜索工具(grep/glob) | 见第 9 节:npm 自带的 `@vscode/ripgrep` 在 openharmony 上解析不到平台包,脚本会把它回退到本包 |
+| `ripgrep` | `brew install ripgrep` | dsh 文件搜索工具(grep/glob) | 见第 10 节:npm 自带的 `@vscode/ripgrep` 在 openharmony 上解析不到平台包,脚本会把它回退到本包 |
 
 > 备注:
 > - `clang`/`clang++` 由 `ohos-sdk` 提供,路径 `~/.harmonybrew/bin/clang{,++}`。
@@ -79,43 +82,43 @@ node-pty / koffi / sharp 原生模块构建。重复执行安全(幂等)。
 
 ---
 
-## 1. 安装命令(最终成功路径)
+## 2. 安装命令(最终成功路径)
 
-### 1.1 安装 dsh(使用 npmmirror 镜像)
+### 2.1 安装 dsh(使用 npmmirror 镜像)
 
 ```bash
 # 官方源不可用,必须 --registry 指定镜像
 npm install -g @deepseek-ai/dsh --registry=https://registry.npmmirror.com
 ```
 
-**第一次会失败**,原因见下文第 2、3 节(node-pty / koffi 原生模块)。成功路径是:
+**第一次会失败**,原因见下文第 3、4 节(node-pty / koffi 原生模块)。成功路径是:
 
 ```bash
 # 1) 先跳过所有构建脚本,把 524 个 JS 包装好
 npm install -g @deepseek-ai/dsh --ignore-scripts --registry=https://registry.npmmirror.com
 
-# 2) 手动构建 node-pty(见第 2 节;本机无 cc/gcc,必须显式指定 clang)
+# 2) 手动构建 node-pty(见第 3 节;本机无 cc/gcc,必须显式指定 clang)
 cd ~/.harmonybrew/lib/node_modules/@deepseek-ai/dsh/node_modules/node-pty
 export CC=~/.harmonybrew/bin/clang CXX=~/.harmonybrew/bin/clang++
 node ~/.harmonybrew/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js rebuild
 
-# 3) 手动构建 koffi(见第 3 节,必须先用 toolchain + 禁用 strip)
+# 3) 手动构建 koffi(见第 4 节,必须先用 toolchain + 禁用 strip)
 cd ~/.harmonybrew/lib/node_modules/@deepseek-ai/dsh/node_modules/koffi
 export CC=~/.harmonybrew/bin/clang CXX=~/.harmonybrew/bin/clang++
 node ./cnoke.cjs -P . -D src/koffi --release \
   -dCMAKE_TOOLCHAIN_FILE=/绝对路径/ohos-aarch64-toolchain.cmake
 
-# 4) sharp 用 WebAssembly 版(见第 4 节)
+# 4) sharp 用 WebAssembly 版(见第 5 节)
 cd ~/.harmonybrew/lib/node_modules/@deepseek-ai/dsh
 npm install @img/sharp-wasm32 --ignore-scripts --registry=https://registry.npmmirror.com --no-save
 
-# 5) 文件搜索工具回退到系统 ripgrep(见第 9 节)
+# 5) 文件搜索工具回退到系统 ripgrep(见第 10 节)
 brew install ripgrep
 #    patch ~/.harmonybrew/lib/node_modules/@deepseek-ai/dsh/node_modules/@vscode/ripgrep/lib/index.js
 #    (或直接跑 dsh-hmos install 自动完成)
 ```
 
-### 1.2 启动 Web UI
+### 2.2 启动 Web UI
 
 ```bash
 # NODE_OPTIONS 不允许 --expose-internals,必须直接传给 node
@@ -127,7 +130,7 @@ node --expose-internals ~/.harmonybrew/lib/node_modules/@deepseek-ai/dsh/lib/bin
 
 ---
 
-## 2. 问题:node-pty 构建失败 "Could not find any Python installation"
+## 3. 问题:node-pty 构建失败 "Could not find any Python installation"
 
 **症状**
 
@@ -150,9 +153,9 @@ brew install python@3.14
 
 ---
 
-## 3. 问题:koffi 构建(最复杂,两个子问题)
+## 4. 问题:koffi 构建(最复杂,两个子问题)
 
-### 3.1 cmake 不认识 HarmonyOS → 错误地编译 x86-64 汇编
+### 4.1 cmake 不认识 HarmonyOS → 错误地编译 x86-64 汇编
 
 **症状**
 
@@ -183,7 +186,7 @@ node ./cnoke.cjs -P . -D src/koffi --release \
   -dCMAKE_TOOLCHAIN_FILE=/绝对路径/ohos-aarch64-toolchain.cmake
 ```
 
-### 3.2 dlopen 拒绝加载被 strip 过的 .node 文件
+### 4.2 dlopen 拒绝加载被 strip 过的 .node 文件
 
 **症状**(构建成功后加载仍失败)
 
@@ -220,7 +223,7 @@ endif()
 
 ---
 
-## 4. 问题:sharp 模块 "Could not load the sharp module using the openharmony-arm64 runtime"
+## 5. 问题:sharp 模块 "Could not load the sharp module using the openharmony-arm64 runtime"
 
 **根因**:sharp 的原生二进制不支持 openharmony-arm64。
 
@@ -234,7 +237,7 @@ npm install @img/sharp-wasm32 --registry=https://registry.npmmirror.com --no-sav
 
 ---
 
-## 5. 问题:启动时报 "--expose-internals is required for HMR service"
+## 6. 问题:启动时报 "--expose-internals is required for HMR service"
 
 **根因**:`@deepseek-ai/cordis-plugin-hmr`(热重载服务)需要 node 的
 `--expose-internals` 标志。
@@ -250,7 +253,7 @@ node --expose-internals ~/.harmonybrew/lib/node_modules/@deepseek-ai/dsh/lib/bin
 
 ---
 
-## 6. 问题:会话保存失败 EPERM link
+## 7. 问题:会话保存失败 EPERM link
 
 **症状**
 
@@ -282,7 +285,7 @@ await rename(tmp, finalPath);
 
 ---
 
-## 7. 问题:凭据文件权限检查失败(mode 660,chmod 无效)
+## 8. 问题:凭据文件权限检查失败(mode 660,chmod 无效)
 
 **症状**(修复 link 后重启服务时)
 
@@ -308,7 +311,7 @@ if (process.platform === "win32" || process.platform === "openharmony") return; 
 
 ---
 
-## 8. 问题:沙箱后端不可用(SANDBOX_UNAVAILABLE)
+## 9. 问题:沙箱后端不可用(SANDBOX_UNAVAILABLE)
 
 **症状**(在 web UI 中发起对话/执行 bash 工具时)
 
@@ -358,7 +361,7 @@ node --expose-internals ~/.harmonybrew/lib/node_modules/@deepseek-ai/dsh/lib/bin
 
 ---
 
-## 9. 问题:文件搜索工具找不到 ripgrep(SEARCH_FAILED)
+## 10. 问题:文件搜索工具找不到 ripgrep(SEARCH_FAILED)
 
 **症状**(agent 调用 grep/glob 搜索工具时)
 
@@ -371,7 +374,7 @@ are installed for this platform (openharmony-arm64).
 通过 `@vscode/ripgrep` 元包按 `process.platform` 拼出平台包
 `@vscode/ripgrep-<platform>-<arch>` 并加载其自带二进制。openharmony 平台
 **没有对应的平台包**;官方 `@vscode/ripgrep-linux-arm64` 的静态二进制又是
-**strip 过的 ELF,hmdfs 拒绝 exec**(与第 3.2 节 koffi 被 strip 后 dlopen 被
+**strip 过的 ELF,hmdfs 拒绝 exec**(与第 4.2 节 koffi 被 strip 后 dlopen 被
 拒是同一规律:本机实测 chmod +x 后执行仍 `Permission denied`)。
 
 **解决**:brew 安装原生 ripgrep(已在依赖表),并 patch
@@ -398,11 +401,11 @@ are installed for this platform (openharmony-arm64).
 
 ---
 
-## 10. 附:验证命令速查
+## 11. 附:验证命令速查
 
 ```bash
 # 环境就绪检查
-command -v node npm npx cmake ninja python3 clang clang++
+command -v node npm npx cmake make ninja python3 clang clang++ rg
 
 # koffi 是否可加载(应输出 LOADED OK)
 node -e "require('~/.harmonybrew/lib/node_modules/@deepseek-ai/dsh/node_modules/koffi/build/koffi/openharmony_arm64/koffi.node')"
@@ -420,7 +423,7 @@ node --input-type=module -e "import('@vscode/ripgrep').then(m=>console.log(m.rgP
 
 ---
 
-## 11. 参考:另一位用户的部署方案(未采纳,备查)
+## 12. 参考:另一位用户的部署方案(未采纳,备查)
 
 另一位鸿蒙 PC 用户在 AtomGit 上发布了部署记录,与本方案对比后**决定不采纳**(截至
 2026-08-14 本机方案已验证可用;如需简化 install 可随时切换)。
@@ -431,7 +434,7 @@ node --input-type=module -e "import('@vscode/ripgrep').then(m=>console.log(m.rgP
 
 | 项目 | 对方方案 | 本方案 | 结论 |
 |---|---|---|---|
-| koffi | **不构建**。patch `dsh-sandbox-local` 第 10 行,把对 `dsh-sandbox-windows-acl` 的顶层 import 改为 win32 条件惰性 `await import()`——koffi 只在 win32 后端被引用,非 win32 永不加载 | 源码构建(本 README 第 3.2 节) | 对方方案 install 更轻(免 cmake/ninja/toolchain/构建),升级后只需重放小补丁;但需改 node_modules,且 sandbox 插件将彻底无 koffi。**本机已构建成功且验证可用,保持现状**;若将来简化,补丁已确认与对方脚本 `reapply-koffi-patch.sh` 完全匹配 |
+| koffi | **不构建**。patch `dsh-sandbox-local` 第 10 行,把对 `dsh-sandbox-windows-acl` 的顶层 import 改为 win32 条件惰性 `await import()`——koffi 只在 win32 后端被引用,非 win32 永不加载 | 源码构建(本 README 第 4.2 节) | 对方方案 install 更轻(免 cmake/ninja/toolchain/构建),升级后只需重放小补丁;但需改 node_modules,且 sandbox 插件将彻底无 koffi。**本机已构建成功且验证可用,保持现状**;若将来简化,补丁已确认与对方脚本 `reapply-koffi-patch.sh` 完全匹配 |
 | 启动 | `setsid` 脱离进程组 + HTTP 探活 + mkdir 原子锁(弃用 flock:鸿蒙系统 PATH 无 flock) | `nohup` + PID 文件 + 端口探测(`dsh-hmos`) | 对方的 setsid + mkdir 锁更抗环境差异,可借鉴 |
 | 开机自启 | 4 层钩子(/etc/profile 系统级、.zshenv、.zshrc、XDG autostart)+ 幂等探活;实测 HiShell 自启有 1~3 分钟延迟 | 无(手动 `dsh-hmos start`) | 暂不需要 |
 
