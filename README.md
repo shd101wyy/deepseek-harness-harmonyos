@@ -378,15 +378,20 @@ are installed for this platform (openharmony-arm64).
 拒是同一规律:本机实测 chmod +x 后执行仍 `Permission denied`)。
 
 **解决**:brew 安装原生 ripgrep(已在依赖表),并 patch
-`@vscode/ripgrep/lib/index.js`,让 openharmony 平台回退到
-`~/.harmonybrew/bin/rg`:
+`@vscode/ripgrep/lib/index.js`,让 openharmony 平台回退到 harmonybrew 的
+`rg`(候选同时包含 `~/.harmonybrew/bin/rg` 与安装时解析出的绝对路径,
+后者保证 HOME 被改写时仍能找到):
 
 ```js
 } catch {
-    const brewRg = `${require('node:os').homedir()}/.harmonybrew/bin/rg`;
-    if (process.platform === 'openharmony' && require('node:fs').existsSync(brewRg)) {
-        resolved = brewRg;
-    } else {
+    const candidates = [
+        `${require('node:os').homedir()}/.harmonybrew/bin/rg`,
+        '/storage/Users/currentUser/.harmonybrew/bin/rg', // 安装时烘焙的绝对路径
+    ];
+    if (process.platform === 'openharmony') {
+        resolved = candidates.find((p) => require('node:fs').existsSync(p));
+    }
+    if (!resolved) {
         throw new Error(/* 原错误 */);
     }
 }

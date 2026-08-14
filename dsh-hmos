@@ -207,6 +207,8 @@ PYEOF
 # 文件搜索工具: dsh 通过 @vscode/ripgrep 解析平台包 @vscode/ripgrep-<platform>-<arch>,
 # openharmony 没有对应平台包,且官方 linux-arm64 静态二进制被 strip 过(hmdfs 拒绝
 # exec,与 koffi 的 dlopen 拒绝 stripped 文件是同一规律)。回退到 harmonybrew 的 ripgrep。
+# 回退候选同时包含 ~/.harmonybrew/bin/rg(HOME 推导)与安装时解析出的绝对路径,
+# 后者保证 HOME 被改写(如沙盒、sudo)时仍能找到真实 rg。
 patch_ripgrep() {
     local f="$DSH_PKG/node_modules/@vscode/ripgrep/lib/index.js"
     [ -f "$f" ] || die "找不到 @vscode/ripgrep"
@@ -214,11 +216,13 @@ patch_ripgrep() {
         log "@vscode/ripgrep 已 patch,跳过"
         return
     fi
-    command -v rg >/dev/null 2>&1 || die "ripgrep 不可用,请先: brew install ripgrep"
-    log "patch @vscode/ripgrep (openharmony 回退到 harmonybrew rg)..."
-    python3 - "$f" <<'PYEOF'
+    local rg_path
+    rg_path="$(command -v rg 2>/dev/null || true)"
+    [ -n "$rg_path" ] || die "ripgrep 不可用,请先: brew install ripgrep"
+    log "patch @vscode/ripgrep (openharmony 回退到 harmonybrew rg: $rg_path)..."
+    python3 - "$f" "$rg_path" <<'PYEOF'
 import sys
-f = sys.argv[1]
+f, rg_path = sys.argv[1], sys.argv[2]
 src = open(f).read()
 old = ('} catch {\n'
        '    throw new Error(\n'
@@ -227,10 +231,17 @@ old = ('} catch {\n'
        '    );\n'
        '}')
 new = ('} catch {\n'
-       '    const brewRg = `${require(\'node:os\').homedir()}/.harmonybrew/bin/rg`;\n'
-       '    if (process.platform === \'openharmony\' && require(\'node:fs\').existsSync(brewRg)) {\n'
-       '        resolved = brewRg;\n'
-       '    } else {\n'
+       '    // HarmonyOS patch: no @vscode/ripgrep-openharmony-* package exists; the\n'
+       '    // upstream linux-arm64 binary is a stripped static ELF that hmdfs refuses\n'
+       '    // to exec. Fall back to harmonybrew\'s native ripgrep instead.\n'
+       '    const candidates = [\n'
+       '        `${require(\'node:os\').homedir()}/.harmonybrew/bin/rg`,\n'
+       '        ' + repr(rg_path) + ',\n'
+       '    ];\n'
+       '    if (process.platform === \'openharmony\') {\n'
+       '        resolved = candidates.find((p) => require(\'node:fs\').existsSync(p));\n'
+       '    }\n'
+       '    if (!resolved) {\n'
        '        throw new Error(\n'
        '            `Could not find ${platformPkg}. ` +\n'
        '            `Ensure optionalDependencies are installed for this platform (${process.platform}-${arch}).`\n'
