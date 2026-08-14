@@ -40,6 +40,13 @@ PID/日志文件(`~/.dsh-hmos/web-<port>.{pid,log}`);`status` 列出全部,
 `stop --port N` 只停指定实例。注意:实例共享 `~/.dsh`(会话/凭据),
 同时跑 agent 任务可能互相干扰。
 
+**重启/关机场景**:start 后未 stop 直接关机,`~/.dsh-hmos/web-*.pid`
+会残留。脚本以**端口探测为准**(PID 仅作辅助,且会校验
+`/proc/<pid>/cmdline` 确属 dsh web),因此:
+- `status` 能正确区分"运行中 / 启动中 / 未运行",残留 PID 文件自动清理
+- `start` 不会误报"已在运行",会正常拉起服务
+- `stop` 不会误杀 PID 被系统复用的无关进程
+
 `install` 在 brew 未安装时会提示访问 https://harmonybrew.atomgit.com 并退出;
 已安装则自动完成依赖(node ohos-sdk cmake make ninja python@3.14)、npm 安装
 `@deepseek-ai/dsh`、三处 HarmonyOS 必需 patch(见下文第 3.2、6、7 节)以及

@@ -213,6 +213,20 @@ extract_port() {
     echo "$port"
 }
 
+# 判断 PID 是否真的属于 dsh web 进程(防止 PID 复用误判:
+# 重启后残留 PID 文件里的 PID 可能已被系统分配给其他进程)
+is_dsh_web_pid() {
+    local pid="$1"
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q "lib/bin\.js web"
+}
+
+# 端口是否有服务响应
+port_up() {
+    node -e "fetch('$1').then(()=>process.exit(0)).catch(()=>process.exit(1))" 2>/dev/null
+}
+
 cmd_start() {
     ensure_brew
     ensure_installed
@@ -224,24 +238,24 @@ cmd_start() {
     local log_file="$STATE_DIR/web-${port}.log"
     local url="http://127.0.0.1:${port}/"
 
-    # 已有 PID 且存活?
-    if [ -f "$pid_file" ]; then
-        local old_pid
-        old_pid="$(cat "$pid_file" 2>/dev/null || true)"
-        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-            log "dsh web (port $port) 已在运行 (PID $old_pid), $url"
-            return 0
-        fi
-        rm -f "$pid_file"
+    # 1) 端口已有服务 → 已在运行(唯一可靠信号)
+    if port_up "$url"; then
+        local old_pid=""
+        [ -f "$pid_file" ] && old_pid="$(cat "$pid_file" 2>/dev/null || true)"
+        log "dsh web (port $port) 已在运行${old_pid:+, PID $old_pid}: $url"
+        return 0
     fi
 
-    # 端口被其他进程占用?
-    if node -e "fetch('$url').then(()=>process.exit(0)).catch(()=>process.exit(1))" 2>/dev/null; then
-        log "端口 $port 已被占用(可能已有 dsh web 在运行,但 PID 文件缺失)。"
-        log "如需重启,请先: dsh-hmos stop --port $port"
+    # 2) PID 文件记录的进程仍活着且确属 dsh web → 可能还在启动中
+    local old_pid2=""
+    [ -f "$pid_file" ] && old_pid2="$(cat "$pid_file" 2>/dev/null || true)"
+    if is_dsh_web_pid "$old_pid2"; then
+        log "检测到 dsh web 进程 (PID $old_pid2) 存在但端口 $port 未就绪,可能仍在启动;请稍后用 dsh-hmos status 查看"
         return 1
     fi
+    rm -f "$pid_file"
 
+    # 3) 启动
     log "后台启动 dsh web (port $port): dsh web $*"
     export DSH_PERMISSION_MODE="danger-full-access"
     nohup node --expose-internals "$DSH_BIN" web "$@" >>"$log_file" 2>&1 &
@@ -249,7 +263,7 @@ cmd_start() {
 
     # 等待就绪
     for _ in $(seq 1 15); do
-        if node -e "fetch('$url').then(()=>process.exit(0)).catch(()=>process.exit(1))" 2>/dev/null; then
+        if port_up "$url"; then
             log "dsh web 已启动: $url (PID $(cat "$pid_file"), 日志 $log_file)"
             return 0
         fi
@@ -267,22 +281,21 @@ cmd_status() {
             local pid port
             pid="$(cat "$pf" 2>/dev/null || true)"
             port="${pf##*web-}"; port="${port%.pid}"
-            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-                if node -e "fetch('http://127.0.0.1:$port/').then(()=>process.exit(0)).catch(()=>process.exit(1))" 2>/dev/null; then
-                    log "dsh web (port $port): 运行中 (PID $pid), http://127.0.0.1:$port 响应正常"
-                else
-                    log "dsh web (port $port): 进程存活 (PID $pid), 但端口 $port 无响应(可能仍在启动或已卡住)"
-                fi
+            if port_up "http://127.0.0.1:${port}/"; then
+                log "dsh web (port $port): 运行中${pid:+, PID $pid}, http://127.0.0.1:$port 响应正常"
+                running=1
+            elif is_dsh_web_pid "$pid"; then
+                log "dsh web (port $port): 进程存在 (PID $pid), 但端口 $port 无响应(可能仍在启动或已卡住)"
                 running=1
             else
-                log "dsh web (port $port): PID 文件残留(进程已退出)"
+                log "dsh web (port $port): 无运行实例(PID 文件残留已清理)"
                 rm -f "$pf"
             fi
         done
     fi
     # 兜底:默认端口有服务但无 PID 记录
     if [ "$running" -eq 0 ]; then
-        if node -e "fetch('http://127.0.0.1:3080/').then(()=>process.exit(0)).catch(()=>process.exit(1))" 2>/dev/null; then
+        if port_up "http://127.0.0.1:3080/"; then
             log "dsh web: 端口 3080 有服务响应,但无 PID 记录(可能是其他方式启动的)"
         else
             log "dsh web: 未运行"
@@ -311,7 +324,8 @@ cmd_stop() {
             port="${pf##*web-}"; port="${port%.pid}"
             if [ -n "$only_port" ] && [ "$port" != "$only_port" ]; then continue; fi
             pid="$(cat "$pf" 2>/dev/null || true)"
-            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            # 仅 kill 确属 dsh web 的进程,防止 PID 复用误杀
+            if is_dsh_web_pid "$pid"; then
                 kill "$pid" 2>/dev/null || true
                 log "已发送停止信号 (port $port, PID $pid)"
                 stopped=1
