@@ -4,9 +4,11 @@
 # 用法:
 #   dsh-hmos install        安装/修复 dsh 及全部依赖(幂等,可重复执行)
 #   dsh-hmos uninstall      卸载 dsh 及脚本状态(保留 ~/.dsh 用户数据)
-#   dsh-hmos start          后台启动 dsh web (http://127.0.0.1:3080)
-#   dsh-hmos status         查看 dsh web 后台运行状态
-#   dsh-hmos stop           停止后台 dsh web
+#   dsh-hmos start [flags]  后台启动 dsh web,flags 原样透传给 dsh web
+#                           (如 --port 8080 / --host 0.0.0.0 / --trusted-host ...);
+#                           不同 --port 可同时跑多个实例
+#   dsh-hmos status         查看所有后台实例运行状态
+#   dsh-hmos stop [--port N] 停止指定端口实例;不带参数停止全部
 #   dsh-hmos exec <args...> 透传执行 dsh 命令,如: dsh-hmos exec --help
 #   dsh-hmos help           显示本帮助
 #
@@ -26,11 +28,8 @@ NPM_LIB="$BREW_PREFIX/lib/node_modules"
 DSH_PKG="$NPM_LIB/@deepseek-ai/dsh"
 DSH_BIN="$DSH_PKG/lib/bin.js"
 STATE_DIR="$HOME/.dsh-hmos"
-PID_FILE="$STATE_DIR/web.pid"
-LOG_FILE="$STATE_DIR/web.log"
 TOOLCHAIN_FILE="$STATE_DIR/ohos-aarch64-toolchain.cmake"
 REGISTRY="https://registry.npmmirror.com"
-PORT=3080
 
 log() { echo "[dsh-hmos] $*"; }
 die() { echo "[dsh-hmos] 错误: $*" >&2; exit 1; }
@@ -201,85 +200,135 @@ install_sharp_wasm() {
 
 # ---------- start / status / stop ----------
 
+# 从参数中提取 --port 值(默认 3080),支持 "--port N" 与 "--port=N" 两种写法
+extract_port() {
+    local port=3080 prev=""
+    for i in "$@"; do
+        if [ "$prev" = "--port" ]; then port="$i"; fi
+        case "$i" in
+            --port=*) port="${i#--port=}";;
+        esac
+        prev="$i"
+    done
+    echo "$port"
+}
+
 cmd_start() {
     ensure_brew
     ensure_installed
     mkdir -p "$STATE_DIR"
 
+    local port
+    port="$(extract_port "$@")"
+    local pid_file="$STATE_DIR/web-${port}.pid"
+    local log_file="$STATE_DIR/web-${port}.log"
+    local url="http://127.0.0.1:${port}/"
+
     # 已有 PID 且存活?
-    if [ -f "$PID_FILE" ]; then
+    if [ -f "$pid_file" ]; then
         local old_pid
-        old_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+        old_pid="$(cat "$pid_file" 2>/dev/null || true)"
         if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
-            log "dsh web 已在运行 (PID $old_pid), http://127.0.0.1:$PORT"
+            log "dsh web (port $port) 已在运行 (PID $old_pid), $url"
             return 0
         fi
-        rm -f "$PID_FILE"
+        rm -f "$pid_file"
     fi
 
     # 端口被其他进程占用?
-    if node -e "fetch('http://127.0.0.1:$PORT').then(()=>process.exit(0)).catch(()=>process.exit(1))" 2>/dev/null; then
-        log "端口 $PORT 已被占用(可能已有 dsh web 在运行,但 PID 文件缺失)。"
-        log "如需重启,请先: dsh-hmos stop"
+    if node -e "fetch('$url').then(()=>process.exit(0)).catch(()=>process.exit(1))" 2>/dev/null; then
+        log "端口 $port 已被占用(可能已有 dsh web 在运行,但 PID 文件缺失)。"
+        log "如需重启,请先: dsh-hmos stop --port $port"
         return 1
     fi
 
-    log "后台启动 dsh web ..."
+    log "后台启动 dsh web (port $port): dsh web $*"
     export DSH_PERMISSION_MODE="danger-full-access"
-    nohup node --expose-internals "$DSH_BIN" web >>"$LOG_FILE" 2>&1 &
-    echo $! > "$PID_FILE"
+    nohup node --expose-internals "$DSH_BIN" web "$@" >>"$log_file" 2>&1 &
+    echo $! > "$pid_file"
 
     # 等待就绪
     for _ in $(seq 1 15); do
-        if node -e "fetch('http://127.0.0.1:$PORT').then(()=>process.exit(0)).catch(()=>process.exit(1))" 2>/dev/null; then
-            log "dsh web 已启动: http://127.0.0.1:$PORT (PID $(cat "$PID_FILE"), 日志 $LOG_FILE)"
+        if node -e "fetch('$url').then(()=>process.exit(0)).catch(()=>process.exit(1))" 2>/dev/null; then
+            log "dsh web 已启动: $url (PID $(cat "$pid_file"), 日志 $log_file)"
             return 0
         fi
         sleep 1
     done
-    log "启动后端口 $PORT 未就绪,请查看日志: $LOG_FILE"
+    log "启动后端口 $port 未就绪,请查看日志: $log_file"
     return 1
 }
 
 cmd_status() {
-    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null || echo 0)" 2>/dev/null; then
-        local pid
-        pid="$(cat "$PID_FILE")"
-        if node -e "fetch('http://127.0.0.1:$PORT').then(()=>process.exit(0)).catch(()=>process.exit(1))" 2>/dev/null; then
-            log "dsh web: 运行中 (PID $pid), http://127.0.0.1:$PORT 响应正常"
+    local running=0
+    if [ -d "$STATE_DIR" ]; then
+        for pf in "$STATE_DIR"/web-*.pid; do
+            [ -f "$pf" ] || continue
+            local pid port
+            pid="$(cat "$pf" 2>/dev/null || true)"
+            port="${pf##*web-}"; port="${port%.pid}"
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                if node -e "fetch('http://127.0.0.1:$port/').then(()=>process.exit(0)).catch(()=>process.exit(1))" 2>/dev/null; then
+                    log "dsh web (port $port): 运行中 (PID $pid), http://127.0.0.1:$port 响应正常"
+                else
+                    log "dsh web (port $port): 进程存活 (PID $pid), 但端口 $port 无响应(可能仍在启动或已卡住)"
+                fi
+                running=1
+            else
+                log "dsh web (port $port): PID 文件残留(进程已退出)"
+                rm -f "$pf"
+            fi
+        done
+    fi
+    # 兜底:默认端口有服务但无 PID 记录
+    if [ "$running" -eq 0 ]; then
+        if node -e "fetch('http://127.0.0.1:3080/').then(()=>process.exit(0)).catch(()=>process.exit(1))" 2>/dev/null; then
+            log "dsh web: 端口 3080 有服务响应,但无 PID 记录(可能是其他方式启动的)"
         else
-            log "dsh web: 进程存活 (PID $pid), 但端口 $PORT 无响应(可能仍在启动或已卡住)"
+            log "dsh web: 未运行"
         fi
-        return 0
+        return 1
     fi
-    if node -e "fetch('http://127.0.0.1:$PORT').then(()=>process.exit(0)).catch(()=>process.exit(1))" 2>/dev/null; then
-        log "dsh web: 端口 $PORT 有服务响应,但无 PID 记录(可能是其他方式启动的)"
-    else
-        log "dsh web: 未运行"
-    fi
-    return 1
+    return 0
 }
 
 cmd_stop() {
+    # 支持 --port N 只停止指定实例;不带参数停止全部
+    local only_port="" prev=""
+    for i in "$@"; do
+        if [ "$prev" = "--port" ]; then only_port="$i"; fi
+        case "$i" in
+            --port=*) only_port="${i#--port=}";;
+        esac
+        prev="$i"
+    done
+
     local stopped=0
-    if [ -f "$PID_FILE" ]; then
-        local pid
-        pid="$(cat "$PID_FILE" 2>/dev/null || true)"
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            kill "$pid" 2>/dev/null || true
-            log "已发送停止信号 (PID $pid)"
+    if [ -d "$STATE_DIR" ]; then
+        for pf in "$STATE_DIR"/web-*.pid; do
+            [ -f "$pf" ] || continue
+            local pid port
+            port="${pf##*web-}"; port="${port%.pid}"
+            if [ -n "$only_port" ] && [ "$port" != "$only_port" ]; then continue; fi
+            pid="$(cat "$pf" 2>/dev/null || true)"
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                kill "$pid" 2>/dev/null || true
+                log "已发送停止信号 (port $port, PID $pid)"
+                stopped=1
+            fi
+            rm -f "$pf"
+        done
+    fi
+    # 兜底:清理残留的 dsh web 进程(仅未指定端口时)
+    if [ -z "$only_port" ]; then
+        local leftovers
+        leftovers="$(ps -ef 2>/dev/null | grep -E "lib/bin\.js web" | grep -v grep | awk '{print $2}' || true)"
+        if [ -n "$leftovers" ]; then
+            # shellcheck disable=SC2086
+            kill $leftovers 2>/dev/null || true
+            log "已清理残留进程: $leftovers"
             stopped=1
         fi
-        rm -f "$PID_FILE"
-    fi
-    # 兜底:清理任何残留的 dsh web 进程
-    local leftovers
-    leftovers="$(ps -ef 2>/dev/null | grep -E "lib/bin\.js web" | grep -v grep | awk '{print $2}' || true)"
-    if [ -n "$leftovers" ]; then
-        # shellcheck disable=SC2086
-        kill $leftovers 2>/dev/null || true
-        log "已清理残留进程: $leftovers"
-        stopped=1
     fi
     if [ "$stopped" -eq 1 ]; then
         log "dsh web 已停止"
@@ -327,9 +376,9 @@ usage() {
 case "${1:-help}" in
     install) shift; cmd_install "$@";;
     uninstall) shift; cmd_uninstall "$@";;
-    start)   cmd_start;;
-    status)  cmd_status;;
-    stop)    cmd_stop;;
+    start)   shift; cmd_start "$@";;
+    status)  cmd_status "$@";;
+    stop)    shift; cmd_stop "$@";;
     exec)    shift; cmd_exec "$@";;
     help|-h|--help) usage;;
     *) echo "未知命令: ${1:-}"; usage; exit 1;;

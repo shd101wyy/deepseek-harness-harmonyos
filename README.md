@@ -19,12 +19,26 @@
 ```bash
 dsh-hmos install      # 检查 brew -> 安装依赖 -> 安装 dsh -> 打 HarmonyOS patch -> 构建原生模块(幂等)
 dsh-hmos uninstall    # 卸载 dsh 及脚本状态(保留 ~/.dsh 用户数据)
-dsh-hmos start        # 后台启动 dsh web (http://127.0.0.1:3080)
-dsh-hmos status       # 查看后台运行状态
-dsh-hmos stop         # 停止后台服务
+dsh-hmos start [flags]  # 后台启动 dsh web;flags 原样透传给 dsh web
+dsh-hmos status       # 查看所有后台实例运行状态
+dsh-hmos stop [--port N]  # 停止指定端口实例;不带参数停止全部
 dsh-hmos exec ...     # 透传运行 dsh 命令,如: dsh-hmos exec --help
 dsh-hmos help         # 帮助
 ```
+
+`start` 支持 dsh web 的全部 flag,并**原样透传**:
+
+```bash
+dsh-hmos start                              # 默认 http://127.0.0.1:3080
+dsh-hmos start --port 8080                  # 自定义端口
+dsh-hmos start --host 0.0.0.0 --port 8080   # 绑定所有网卡
+dsh-hmos start --trusted-host myhost:8080   # 额外信任的来源
+```
+
+**多实例**:不同 `--port` 可同时运行多个 web 实例,各自独立的
+PID/日志文件(`~/.dsh-hmos/web-<port>.{pid,log}`);`status` 列出全部,
+`stop --port N` 只停指定实例。注意:实例共享 `~/.dsh`(会话/凭据),
+同时跑 agent 任务可能互相干扰。
 
 `install` 在 brew 未安装时会提示访问 https://harmonybrew.atomgit.com 并退出;
 已安装则自动完成依赖(node ohos-sdk cmake make ninja python@3.14)、npm 安装
