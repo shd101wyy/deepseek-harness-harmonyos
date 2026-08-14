@@ -1,0 +1,313 @@
+#!/usr/bin/env bash
+# dsh-hmos — DeepSeek Harness (dsh) 助手脚本(HarmonyOS / harmonybrew 专用)
+#
+# 用法:
+#   dsh-hmos install        安装/修复 dsh 及全部依赖(幂等,可重复执行)
+#   dsh-hmos start          后台启动 dsh web (http://127.0.0.1:3080)
+#   dsh-hmos status         查看 dsh web 后台运行状态
+#   dsh-hmos stop           停止后台 dsh web
+#   dsh-hmos exec <args...> 透传执行 dsh 命令,如: dsh-hmos exec --help
+#   dsh-hmos help           显示本帮助
+#
+# 说明:
+# - brew 未安装时 install 会提示访问 https://harmonybrew.atomgit.com 后退出
+# - 自动应用 HarmonyOS 必需的三处 patch:
+#     1) koffi: 禁用 POST_BUILD strip(hmdfs 的 dlopen 拒绝 stripped .node)
+#     2) dsh-session-persistence-jsonl: link -> rename(hmdfs 不支持硬链接)
+#     3) dsh-credentials-local: openharmony 平台跳过 0600 权限检查(chmod 无效)
+# - 依赖: node ohos-sdk cmake ninja python@3.14(通过 brew 安装)
+set -euo pipefail
+
+BREW_PREFIX="$HOME/.harmonybrew"
+BREW_BIN="$BREW_PREFIX/bin/brew"
+BIN_DIR="$BREW_PREFIX/bin"
+NPM_LIB="$BREW_PREFIX/lib/node_modules"
+DSH_PKG="$NPM_LIB/@deepseek-ai/dsh"
+DSH_BIN="$DSH_PKG/lib/bin.js"
+STATE_DIR="$HOME/.dsh-hmos"
+PID_FILE="$STATE_DIR/web.pid"
+LOG_FILE="$STATE_DIR/web.log"
+TOOLCHAIN_FILE="$STATE_DIR/ohos-aarch64-toolchain.cmake"
+REGISTRY="https://registry.npmmirror.com"
+PORT=3080
+
+log() { echo "[dsh-hmos] $*"; }
+die() { echo "[dsh-hmos] 错误: $*" >&2; exit 1; }
+
+# ---------- 基础环境 ----------
+
+ensure_brew() {
+    if ! command -v brew >/dev/null 2>&1 && [ ! -x "$BREW_BIN" ]; then
+        echo "[dsh-hmos] 未检测到 harmonybrew。"
+        echo "[dsh-hmos] 请先按照 https://harmonybrew.atomgit.com 的指引安装 harmonybrew,"
+        echo "[dsh-hmos] 然后重新运行: dsh-hmos install"
+        exit 1
+    fi
+    export PATH="$BIN_DIR:$PATH"
+}
+
+ensure_installed() {
+    [ -x "$DSH_BIN" ] || die "dsh 尚未安装,请先运行: dsh-hmos install"
+}
+
+# ---------- install ----------
+
+cmd_install() {
+    ensure_brew
+
+    # 1. 系统依赖
+    log "检查/安装依赖: node ohos-sdk cmake make ninja python@3.14 ..."
+    brew install node ohos-sdk cmake make ninja python@3.14 2>&1 | tail -3 || die "brew install 失败"
+    command -v clang >/dev/null 2>&1 || die "ohos-sdk 未提供 clang,请检查安装"
+    command -v python3 >/dev/null 2>&1 || die "python3 不可用,请检查 python@3.14 安装"
+
+    # 2. dsh 本体(跳过构建脚本,后续手动构建原生模块)
+    if command -v dsh >/dev/null 2>&1; then
+        log "dsh 已安装: $(dsh --version 2>/dev/null || echo '?')"
+    else
+        log "安装 @deepseek-ai/dsh (npm, npmmirror 镜像)..."
+        npm install -g @deepseek-ai/dsh --ignore-scripts --registry="$REGISTRY" || die "npm 安装 dsh 失败"
+    fi
+
+    # 3. 生成 koffi 构建用 toolchain 文件
+    mkdir -p "$STATE_DIR"
+    cat > "$TOOLCHAIN_FILE" <<'EOF'
+# Force cmake to treat HarmonyOS as Linux/aarch64 (cmake does not know
+# HarmonyOS: CMAKE_SYSTEM_PROCESSOR is "unknown", which breaks koffi's
+# ABI selection that matches "aarch|arm").
+set(CMAKE_SYSTEM_NAME Linux)
+execute_process(COMMAND uname -m OUTPUT_VARIABLE HOST_ARCH OUTPUT_STRIP_TRAILING_WHITESPACE)
+set(CMAKE_SYSTEM_PROCESSOR ${HOST_ARCH})
+EOF
+
+    # 4. 应用 HarmonyOS 必需 patch
+    patch_koffi_cmake
+    patch_session_persistence
+    patch_credentials_local
+
+    # 5. 构建原生模块
+    build_node_pty
+    build_koffi
+    install_sharp_wasm
+
+    log "安装/修复完成。启动: dsh-hmos start"
+}
+
+# koffi: 禁用 POST_BUILD strip(hmdfs 的 dlopen 拒绝 stripped .node)
+patch_koffi_cmake() {
+    local f="$DSH_PKG/node_modules/koffi/src/koffi/CMakeLists.txt"
+    [ -f "$f" ] || die "找不到 koffi CMakeLists.txt"
+    if grep -q "strip DISABLED for HarmonyOS" "$f"; then
+        log "koffi CMakeLists.txt 已 patch,跳过"
+        return
+    fi
+    log "patch koffi CMakeLists.txt (禁用 strip)..."
+    python3 - "$f" <<'PYEOF'
+import sys
+f = sys.argv[1]
+src = open(f).read()
+marker = 'if(CMAKE_BUILD_TYPE STREQUAL "Release")\n    if(APPLE)'
+if marker not in src:
+    sys.exit("koffi CMakeLists.txt 结构不符合预期,请手动处理")
+start = src.find(marker)
+end = src.find('# ---- Debug ----', start)
+if end == -1:
+    sys.exit("找不到 Debug 段标记")
+block = ('if(CMAKE_BUILD_TYPE STREQUAL "Release")\n'
+         '    # strip DISABLED for HarmonyOS: stripped .node fails to dlopen\n'
+         '    # (Permission denied). Keep the symbol table so the loader accepts it.\n'
+         'endif()\n\n')
+open(f, 'w').write(src[:start] + block + src[end:])
+print("patched")
+PYEOF
+}
+
+# 会话保存: hmdfs 不支持硬链接, link -> rename
+patch_session_persistence() {
+    local f="$DSH_PKG/node_modules/@deepseek-ai/dsh-session-persistence-jsonl/lib/index.js"
+    [ -f "$f" ] || die "找不到 dsh-session-persistence-jsonl"
+    if grep -q "await rename(tmp, finalPath)" "$f"; then
+        log "dsh-session-persistence-jsonl 已 patch,跳过"
+        return
+    fi
+    log "patch dsh-session-persistence-jsonl (link -> rename)..."
+    python3 - "$f" <<'PYEOF'
+import sys
+f = sys.argv[1]
+src = open(f).read()
+old_import = 'import { link, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, stat, truncate } from "node:fs/promises";'
+new_import = 'import { rename, mkdir, mkdtemp, open, readFile, readdir, realpath, rm, stat, truncate } from "node:fs/promises";'
+old_call = '\t\t\tawait link(tmp, finalPath);'
+new_call = '\t\t\tawait rename(tmp, finalPath);'
+if old_import not in src or old_call not in src:
+    sys.exit("文件结构不符合预期,请手动处理")
+open(f, 'w').write(src.replace(old_import, new_import).replace(old_call, new_call))
+print("patched")
+PYEOF
+}
+
+# 凭据检查: hmdfs 固定 660 且 chmod 无效, openharmony 平台跳过
+patch_credentials_local() {
+    local f="$DSH_PKG/node_modules/@deepseek-ai/dsh-credentials-local/lib/index.js"
+    [ -f "$f" ] || die "找不到 dsh-credentials-local"
+    if grep -q "openharmony" "$f"; then
+        log "dsh-credentials-local 已 patch,跳过"
+        return
+    fi
+    log "patch dsh-credentials-local (跳过 0600 检查)..."
+    python3 - "$f" <<'PYEOF'
+import sys
+f = sys.argv[1]
+src = open(f).read()
+old = '\tif (process.platform === "win32") return;'
+new = '\tif (process.platform === "win32" || process.platform === "openharmony") return; // hmdfs: mode is always 660 and chmod is a no-op'
+if old not in src:
+    sys.exit("文件结构不符合预期,请手动处理")
+open(f, 'w').write(src.replace(old, new, 1))
+print("patched")
+PYEOF
+}
+
+build_node_pty() {
+    local out="$DSH_PKG/node_modules/node-pty/build/Release/pty.node"
+    [ -f "$out" ] && { log "node-pty 已构建,跳过"; return; }
+    command -v make >/dev/null 2>&1 || die "make 不可用(node-gyp 构建 node-pty 需要),请检查 brew install make"
+    log "构建 node-pty (node-gyp)..."
+    local gyp="$NPM_LIB/npm/node_modules/node-gyp/bin/node-gyp.js"
+    [ -f "$gyp" ] || die "找不到 node-gyp"
+    ( cd "$DSH_PKG/node_modules/node-pty" && node "$gyp" rebuild ) || die "node-pty 构建失败"
+}
+
+build_koffi() {
+    local out="$DSH_PKG/node_modules/koffi/build/koffi/openharmony_arm64/koffi.node"
+    [ -f "$out" ] && { log "koffi 已构建,跳过"; return; }
+    log "构建 koffi (源码, toolchain + 禁用 strip)..."
+    export CC="$BIN_DIR/clang" CXX="$BIN_DIR/clang++"
+    ( cd "$DSH_PKG/node_modules/koffi" && \
+      node ./cnoke.cjs -P . -D src/koffi --release \
+        -dCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN_FILE" ) || die "koffi 构建失败"
+    [ -f "$out" ] || die "koffi 构建产物缺失"
+}
+
+install_sharp_wasm() {
+    if [ -d "$DSH_PKG/node_modules/@img/sharp-wasm32" ]; then
+        log "sharp-wasm32 已安装,跳过"
+        return
+    fi
+    log "安装 @img/sharp-wasm32 (sharp 的 WebAssembly 后端)..."
+    ( cd "$DSH_PKG" && npm install @img/sharp-wasm32 --registry="$REGISTRY" --no-save ) || die "sharp-wasm32 安装失败"
+}
+
+# ---------- start / status / stop ----------
+
+cmd_start() {
+    ensure_brew
+    ensure_installed
+    mkdir -p "$STATE_DIR"
+
+    # 已有 PID 且存活?
+    if [ -f "$PID_FILE" ]; then
+        local old_pid
+        old_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+            log "dsh web 已在运行 (PID $old_pid), http://127.0.0.1:$PORT"
+            return 0
+        fi
+        rm -f "$PID_FILE"
+    fi
+
+    # 端口被其他进程占用?
+    if node -e "fetch('http://127.0.0.1:$PORT').then(()=>process.exit(0)).catch(()=>process.exit(1))" 2>/dev/null; then
+        log "端口 $PORT 已被占用(可能已有 dsh web 在运行,但 PID 文件缺失)。"
+        log "如需重启,请先: dsh-hmos stop"
+        return 1
+    fi
+
+    log "后台启动 dsh web ..."
+    export DSH_PERMISSION_MODE="danger-full-access"
+    nohup node --expose-internals "$DSH_BIN" web >>"$LOG_FILE" 2>&1 &
+    echo $! > "$PID_FILE"
+
+    # 等待就绪
+    for _ in $(seq 1 15); do
+        if node -e "fetch('http://127.0.0.1:$PORT').then(()=>process.exit(0)).catch(()=>process.exit(1))" 2>/dev/null; then
+            log "dsh web 已启动: http://127.0.0.1:$PORT (PID $(cat "$PID_FILE"), 日志 $LOG_FILE)"
+            return 0
+        fi
+        sleep 1
+    done
+    log "启动后端口 $PORT 未就绪,请查看日志: $LOG_FILE"
+    return 1
+}
+
+cmd_status() {
+    if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE" 2>/dev/null || echo 0)" 2>/dev/null; then
+        local pid
+        pid="$(cat "$PID_FILE")"
+        if node -e "fetch('http://127.0.0.1:$PORT').then(()=>process.exit(0)).catch(()=>process.exit(1))" 2>/dev/null; then
+            log "dsh web: 运行中 (PID $pid), http://127.0.0.1:$PORT 响应正常"
+        else
+            log "dsh web: 进程存活 (PID $pid), 但端口 $PORT 无响应(可能仍在启动或已卡住)"
+        fi
+        return 0
+    fi
+    if node -e "fetch('http://127.0.0.1:$PORT').then(()=>process.exit(0)).catch(()=>process.exit(1))" 2>/dev/null; then
+        log "dsh web: 端口 $PORT 有服务响应,但无 PID 记录(可能是其他方式启动的)"
+    else
+        log "dsh web: 未运行"
+    fi
+    return 1
+}
+
+cmd_stop() {
+    local stopped=0
+    if [ -f "$PID_FILE" ]; then
+        local pid
+        pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            log "已发送停止信号 (PID $pid)"
+            stopped=1
+        fi
+        rm -f "$PID_FILE"
+    fi
+    # 兜底:清理任何残留的 dsh web 进程
+    local leftovers
+    leftovers="$(ps -ef 2>/dev/null | grep -E "lib/bin\.js web" | grep -v grep | awk '{print $2}' || true)"
+    if [ -n "$leftovers" ]; then
+        # shellcheck disable=SC2086
+        kill $leftovers 2>/dev/null || true
+        log "已清理残留进程: $leftovers"
+        stopped=1
+    fi
+    if [ "$stopped" -eq 1 ]; then
+        log "dsh web 已停止"
+    else
+        log "dsh web 未在运行"
+    fi
+}
+
+# ---------- exec ----------
+
+cmd_exec() {
+    ensure_brew
+    ensure_installed
+    export DSH_PERMISSION_MODE="${DSH_PERMISSION_MODE:-danger-full-access}"
+    node --expose-internals "$DSH_BIN" "$@"
+}
+
+# ---------- main ----------
+
+usage() {
+    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+case "${1:-help}" in
+    install) shift; cmd_install "$@";;
+    start)   cmd_start;;
+    status)  cmd_status;;
+    stop)    cmd_stop;;
+    exec)    shift; cmd_exec "$@";;
+    help|-h|--help) usage;;
+    *) echo "未知命令: ${1:-}"; usage; exit 1;;
+esac
