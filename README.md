@@ -17,18 +17,21 @@
 `~/.harmonybrew/bin/dsh-hmos`,可直接使用:
 
 ```bash
-dsh-hmos install    # 检查 brew -> 安装依赖 -> 安装 dsh -> 打 HarmonyOS patch -> 构建原生模块(幂等)
-dsh-hmos start      # 后台启动 dsh web (http://127.0.0.1:3080)
-dsh-hmos status     # 查看后台运行状态
-dsh-hmos stop       # 停止后台服务
-dsh-hmos exec ...   # 透传运行 dsh 命令,如: dsh-hmos exec --help
-dsh-hmos help       # 帮助
+dsh-hmos install      # 检查 brew -> 安装依赖 -> 安装 dsh -> 打 HarmonyOS patch -> 构建原生模块(幂等)
+dsh-hmos uninstall    # 卸载 dsh 及脚本状态(保留 ~/.dsh 用户数据)
+dsh-hmos start        # 后台启动 dsh web (http://127.0.0.1:3080)
+dsh-hmos status       # 查看后台运行状态
+dsh-hmos stop         # 停止后台服务
+dsh-hmos exec ...     # 透传运行 dsh 命令,如: dsh-hmos exec --help
+dsh-hmos help         # 帮助
 ```
 
 `install` 在 brew 未安装时会提示访问 https://harmonybrew.atomgit.com 并退出;
-已安装则自动完成依赖(node ohos-sdk cmake ninja python@3.14)、npm 安装
+已安装则自动完成依赖(node ohos-sdk cmake make ninja python@3.14)、npm 安装
 `@deepseek-ai/dsh`、三处 HarmonyOS 必需 patch(见下文第 3.2、6、7 节)以及
 node-pty / koffi / sharp 原生模块构建。重复执行安全(幂等)。
+`uninstall` 会先停服务、卸载 npm 包并清理脚本状态目录(`~/.dsh-hmos`),
+**保留** `~/.dsh`(会话/凭据/配置);彻底清除需手动删除 `~/.dsh`。
 
 ---
 

@@ -3,6 +3,7 @@
 #
 # 用法:
 #   dsh-hmos install        安装/修复 dsh 及全部依赖(幂等,可重复执行)
+#   dsh-hmos uninstall      卸载 dsh 及脚本状态(保留 ~/.dsh 用户数据)
 #   dsh-hmos start          后台启动 dsh web (http://127.0.0.1:3080)
 #   dsh-hmos status         查看 dsh web 后台运行状态
 #   dsh-hmos stop           停止后台 dsh web
@@ -296,6 +297,27 @@ cmd_exec() {
     node --expose-internals "$DSH_BIN" "$@"
 }
 
+# ---------- uninstall ----------
+
+cmd_uninstall() {
+    ensure_brew
+    # 先停掉正在运行的服务
+    cmd_stop 2>/dev/null || true
+    if command -v dsh >/dev/null 2>&1; then
+        log "卸载 @deepseek-ai/dsh (npm)..."
+        npm uninstall -g @deepseek-ai/dsh 2>&1 | tail -3 || die "npm uninstall 失败"
+        log "dsh 已卸载"
+    else
+        log "dsh 未安装,跳过 npm 卸载"
+    fi
+    # 清理脚本自身状态(pid/log/toolchain),保留 ~/.dsh 用户数据
+    if [ -d "$STATE_DIR" ]; then
+        rm -rf "$STATE_DIR"
+        log "已清理脚本状态目录: $STATE_DIR"
+    fi
+    log "卸载完成。~/.dsh(会话/凭据/配置)已保留;如需彻底清除请手动删除 ~/.dsh"
+}
+
 # ---------- main ----------
 
 usage() {
@@ -304,6 +326,7 @@ usage() {
 
 case "${1:-help}" in
     install) shift; cmd_install "$@";;
+    uninstall) shift; cmd_uninstall "$@";;
     start)   cmd_start;;
     status)  cmd_status;;
     stop)    cmd_stop;;
