@@ -14,11 +14,12 @@
 #
 # 说明:
 # - brew 未安装时 install 会提示访问 https://harmonybrew.atomgit.com 后退出
-# - 自动应用 HarmonyOS 必需的三处 patch:
+# - 自动应用 HarmonyOS 必需的四处 patch:
 #     1) koffi: 禁用 POST_BUILD strip(hmdfs 的 dlopen 拒绝 stripped .node)
 #     2) dsh-session-persistence-jsonl: link -> rename(hmdfs 不支持硬链接)
 #     3) dsh-credentials-local: openharmony 平台跳过 0600 权限检查(chmod 无效)
-# - 依赖: node ohos-sdk cmake ninja python@3.14(通过 brew 安装)
+#     4) @vscode/ripgrep: openharmony 无平台包,回退到 harmonybrew 的 ripgrep
+# - 依赖: node ohos-sdk cmake make ninja python@3.14 ripgrep(通过 brew 安装)
 set -euo pipefail
 
 BREW_PREFIX="$HOME/.harmonybrew"
@@ -56,8 +57,8 @@ cmd_install() {
     ensure_brew
 
     # 1. 系统依赖
-    log "检查/安装依赖: node ohos-sdk cmake make ninja python@3.14 ..."
-    brew install node ohos-sdk cmake make ninja python@3.14 2>&1 | tail -3 || die "brew install 失败"
+    log "检查/安装依赖: node ohos-sdk cmake make ninja python@3.14 ripgrep ..."
+    brew install node ohos-sdk cmake make ninja python@3.14 ripgrep 2>&1 | tail -3 || die "brew install 失败"
     command -v clang >/dev/null 2>&1 || die "ohos-sdk 未提供 clang,请检查安装"
     command -v python3 >/dev/null 2>&1 || die "python3 不可用,请检查 python@3.14 安装"
 
@@ -84,6 +85,7 @@ EOF
     patch_koffi_cmake
     patch_session_persistence
     patch_credentials_local
+    patch_ripgrep
 
     # 5. 构建原生模块
     build_node_pty
@@ -168,6 +170,46 @@ print("patched")
 PYEOF
 }
 
+# 文件搜索工具: dsh 通过 @vscode/ripgrep 解析平台包 @vscode/ripgrep-<platform>-<arch>,
+# openharmony 没有对应平台包,且官方 linux-arm64 静态二进制被 strip 过(hmdfs 拒绝
+# exec,与 koffi 的 dlopen 拒绝 stripped 文件是同一规律)。回退到 harmonybrew 的 ripgrep。
+patch_ripgrep() {
+    local f="$DSH_PKG/node_modules/@vscode/ripgrep/lib/index.js"
+    [ -f "$f" ] || die "找不到 @vscode/ripgrep"
+    if grep -q "harmonybrew" "$f"; then
+        log "@vscode/ripgrep 已 patch,跳过"
+        return
+    fi
+    command -v rg >/dev/null 2>&1 || die "ripgrep 不可用,请先: brew install ripgrep"
+    log "patch @vscode/ripgrep (openharmony 回退到 harmonybrew rg)..."
+    python3 - "$f" <<'PYEOF'
+import sys
+f = sys.argv[1]
+src = open(f).read()
+old = ('} catch {\n'
+       '    throw new Error(\n'
+       '        `Could not find ${platformPkg}. ` +\n'
+       '        `Ensure optionalDependencies are installed for this platform (${process.platform}-${arch}).`\n'
+       '    );\n'
+       '}')
+new = ('} catch {\n'
+       '    const brewRg = `${require(\'node:os\').homedir()}/.harmonybrew/bin/rg`;\n'
+       '    if (process.platform === \'openharmony\' && require(\'node:fs\').existsSync(brewRg)) {\n'
+       '        resolved = brewRg;\n'
+       '    } else {\n'
+       '        throw new Error(\n'
+       '            `Could not find ${platformPkg}. ` +\n'
+       '            `Ensure optionalDependencies are installed for this platform (${process.platform}-${arch}).`\n'
+       '        );\n'
+       '    }\n'
+       '}')
+if old not in src:
+    sys.exit("文件结构不符合预期,请手动处理")
+open(f, 'w').write(src.replace(old, new, 1))
+print("patched")
+PYEOF
+}
+
 build_node_pty() {
     local out="$DSH_PKG/node_modules/node-pty/build/Release/pty.node"
     [ -f "$out" ] && { log "node-pty 已构建,跳过"; return; }
@@ -175,6 +217,8 @@ build_node_pty() {
     log "构建 node-pty (node-gyp)..."
     local gyp="$NPM_LIB/npm/node_modules/node-gyp/bin/node-gyp.js"
     [ -f "$gyp" ] || die "找不到 node-gyp"
+    # 显式锁定 clang:本机无 cc/gcc,make 内置默认 CC=cc 会导致 C 编译失败
+    export CC="$BIN_DIR/clang" CXX="$BIN_DIR/clang++"
     ( cd "$DSH_PKG/node_modules/node-pty" && node "$gyp" rebuild ) || die "node-pty 构建失败"
 }
 
@@ -195,7 +239,7 @@ install_sharp_wasm() {
         return
     fi
     log "安装 @img/sharp-wasm32 (sharp 的 WebAssembly 后端)..."
-    ( cd "$DSH_PKG" && npm install @img/sharp-wasm32 --registry="$REGISTRY" --no-save ) || die "sharp-wasm32 安装失败"
+    ( cd "$DSH_PKG" && npm install @img/sharp-wasm32 --ignore-scripts --registry="$REGISTRY" --no-save ) || die "sharp-wasm32 安装失败"
 }
 
 # ---------- start / status / stop ----------
@@ -222,9 +266,9 @@ is_dsh_web_pid() {
     tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q "lib/bin\.js web"
 }
 
-# 端口是否有服务响应
+# 端口是否有服务响应(2 秒超时,防止对无响应的连接无限等待)
 port_up() {
-    node -e "fetch('$1').then(()=>process.exit(0)).catch(()=>process.exit(1))" 2>/dev/null
+    node -e "fetch('$1', { signal: AbortSignal.timeout(2000) }).then(()=>process.exit(0)).catch(()=>process.exit(1))" 2>/dev/null
 }
 
 cmd_start() {
@@ -234,6 +278,9 @@ cmd_start() {
 
     local port
     port="$(extract_port "$@")"
+    case "$port" in
+        ''|*[!0-9]*) die "无效端口: '$port'(应为纯数字,如 --port 8080)";;
+    esac
     local pid_file="$STATE_DIR/web-${port}.pid"
     local log_file="$STATE_DIR/web-${port}.log"
     local url="http://127.0.0.1:${port}/"
@@ -384,7 +431,7 @@ cmd_uninstall() {
 # ---------- main ----------
 
 usage() {
-    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 case "${1:-help}" in

@@ -48,8 +48,8 @@ PID/日志文件(`~/.dsh-hmos/web-<port>.{pid,log}`);`status` 列出全部,
 - `stop` 不会误杀 PID 被系统复用的无关进程
 
 `install` 在 brew 未安装时会提示访问 https://harmonybrew.atomgit.com 并退出;
-已安装则自动完成依赖(node ohos-sdk cmake make ninja python@3.14)、npm 安装
-`@deepseek-ai/dsh`、三处 HarmonyOS 必需 patch(见下文第 3.2、6、7 节)以及
+已安装则自动完成依赖(node ohos-sdk cmake make ninja python@3.14 ripgrep)、npm 安装
+`@deepseek-ai/dsh`、四处 HarmonyOS 必需 patch(见下文第 3.2、6、7、9 节)以及
 node-pty / koffi / sharp 原生模块构建。重复执行安全(幂等)。
 `uninstall` 会先停服务、卸载 npm 包并清理脚本状态目录(`~/.dsh-hmos`),
 **保留** `~/.dsh`(会话/凭据/配置);彻底清除需手动删除 `~/.dsh`。
@@ -66,12 +66,16 @@ node-pty / koffi / sharp 原生模块构建。重复执行安全(幂等)。
 | `make` | `brew install make` | node-pty 构建(node-gyp 使用 make) | 本机实测必要,勿漏 |
 | `ninja` | `brew install ninja` | koffi 的 cmake 生成器 | |
 | `python@3.14` | `brew install python@3.14` | node-pty 构建(node-gyp 需要 Python) | 装完后 `python3` 在 `~/.harmonybrew/bin/python3` |
+| `ripgrep` | `brew install ripgrep` | dsh 文件搜索工具(grep/glob) | 见第 9 节:npm 自带的 `@vscode/ripgrep` 在 openharmony 上解析不到平台包,脚本会把它回退到本包 |
 
 > 备注:
 > - `clang`/`clang++` 由 `ohos-sdk` 提供,路径 `~/.harmonybrew/bin/clang{,++}`。
 > - `make` 与 `ninja` 都必需,用途不同:`make` 供 node-gyp 构建 node-pty,
 >   `ninja` 供 cmake 构建 koffi(本机实测 harmonybrew 的 make 直接在
 >   `~/.harmonybrew/bin/make`,不是 keg-only 的 gmake)。
+> - GNU grep **非必需**(脚本与 dsh 只用 Toybox grep 也支持的基础参数
+>   `-q`/`-E`/`-v`);如需可 `brew install grep`。注意 brew 没有 `-y` 参数
+>   (那是 apt/yum 的写法),直接 `brew install <包名>` 即可。
 
 ---
 
@@ -90,8 +94,9 @@ npm install -g @deepseek-ai/dsh --registry=https://registry.npmmirror.com
 # 1) 先跳过所有构建脚本,把 524 个 JS 包装好
 npm install -g @deepseek-ai/dsh --ignore-scripts --registry=https://registry.npmmirror.com
 
-# 2) 手动构建 node-pty(见第 2 节)
+# 2) 手动构建 node-pty(见第 2 节;本机无 cc/gcc,必须显式指定 clang)
 cd ~/.harmonybrew/lib/node_modules/@deepseek-ai/dsh/node_modules/node-pty
+export CC=~/.harmonybrew/bin/clang CXX=~/.harmonybrew/bin/clang++
 node ~/.harmonybrew/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js rebuild
 
 # 3) 手动构建 koffi(见第 3 节,必须先用 toolchain + 禁用 strip)
@@ -102,7 +107,12 @@ node ./cnoke.cjs -P . -D src/koffi --release \
 
 # 4) sharp 用 WebAssembly 版(见第 4 节)
 cd ~/.harmonybrew/lib/node_modules/@deepseek-ai/dsh
-npm install @img/sharp-wasm32 --registry=https://registry.npmmirror.com --no-save
+npm install @img/sharp-wasm32 --ignore-scripts --registry=https://registry.npmmirror.com --no-save
+
+# 5) 文件搜索工具回退到系统 ripgrep(见第 9 节)
+brew install ripgrep
+#    patch ~/.harmonybrew/lib/node_modules/@deepseek-ai/dsh/node_modules/@vscode/ripgrep/lib/index.js
+#    (或直接跑 dsh-hmos install 自动完成)
 ```
 
 ### 1.2 启动 Web UI
@@ -133,6 +143,9 @@ gyp ERR! System HarmonyOS HongMeng Kernel 1.12.0
 
 ```bash
 brew install python@3.14
+# 另:本机没有 cc/gcc(只有 ohos-sdk 的 clang),构建前显式指定:
+# export CC=~/.harmonybrew/bin/clang CXX=~/.harmonybrew/bin/clang++
+# (make 内置默认 CC=cc,不显式指定时 C 编译会报 cc: command not found)
 ```
 
 ---
@@ -345,7 +358,47 @@ node --expose-internals ~/.harmonybrew/lib/node_modules/@deepseek-ai/dsh/lib/bin
 
 ---
 
-## 9. 附:验证命令速查
+## 9. 问题:文件搜索工具找不到 ripgrep(SEARCH_FAILED)
+
+**症状**(agent 调用 grep/glob 搜索工具时)
+
+```text
+Could not find @vscode/ripgrep-openharmony-arm64. Ensure optionalDependencies
+are installed for this platform (openharmony-arm64).
+```
+
+**根因**:dsh 的文件搜索工具(`dsh-tool-fs-search`)不调用系统 `rg`,而是
+通过 `@vscode/ripgrep` 元包按 `process.platform` 拼出平台包
+`@vscode/ripgrep-<platform>-<arch>` 并加载其自带二进制。openharmony 平台
+**没有对应的平台包**;官方 `@vscode/ripgrep-linux-arm64` 的静态二进制又是
+**strip 过的 ELF,hmdfs 拒绝 exec**(与第 3.2 节 koffi 被 strip 后 dlopen 被
+拒是同一规律:本机实测 chmod +x 后执行仍 `Permission denied`)。
+
+**解决**:brew 安装原生 ripgrep(已在依赖表),并 patch
+`@vscode/ripgrep/lib/index.js`,让 openharmony 平台回退到
+`~/.harmonybrew/bin/rg`:
+
+```js
+} catch {
+    const brewRg = `${require('node:os').homedir()}/.harmonybrew/bin/rg`;
+    if (process.platform === 'openharmony' && require('node:fs').existsSync(brewRg)) {
+        resolved = brewRg;
+    } else {
+        throw new Error(/* 原错误 */);
+    }
+}
+```
+
+该解析是**惰性**的(首次搜索调用时才发生),所以 patch 后无需重启正在运行的
+实例即可生效;`dsh-hmos install` 已自动打此补丁(幂等)。
+
+> ⚠️ 同样是 node_modules 内的补丁,升级 dsh 后需重打(重跑 `dsh-hmos install` 即可)。
+> 注意:系统 ripgrep 装好但**不打此补丁时搜索工具仍然不可用**——dsh 不会自动
+> 发现系统 `rg`。
+
+---
+
+## 10. 附:验证命令速查
 
 ```bash
 # 环境就绪检查
@@ -359,11 +412,15 @@ node -e "require('sharp')"
 
 # Web UI 是否存活
 node -e "fetch('http://127.0.0.1:3080').then(r=>console.log(r.status))"
+
+# ripgrep 解析是否已 patch(应输出 ~/.harmonybrew/bin/rg)
+cd ~/.harmonybrew/lib/node_modules/@deepseek-ai/dsh
+node --input-type=module -e "import('@vscode/ripgrep').then(m=>console.log(m.rgPath))"
 ```
 
 ---
 
-## 10. 参考:另一位用户的部署方案(未采纳,备查)
+## 11. 参考:另一位用户的部署方案(未采纳,备查)
 
 另一位鸿蒙 PC 用户在 AtomGit 上发布了部署记录,与本方案对比后**决定不采纳**(截至
 2026-08-14 本机方案已验证可用;如需简化 install 可随时切换)。
