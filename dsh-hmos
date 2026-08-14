@@ -408,7 +408,8 @@ cmd_stop() {
         prev="$i"
     done
     case "$only_port" in
-        ''|*[!0-9]*) die "无效端口: '$only_port'(应为纯数字,如 --port 8080)";;
+        '') : ;;                       # 空 = 不带 --port,停止全部(默认行为)
+        *[!0-9]*) die "无效端口: '$only_port'(应为纯数字,如 --port 8080)";;
     esac
 
     local stopped=0
