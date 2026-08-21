@@ -61,6 +61,38 @@ ensure_installed() {
     [ -x "$DSH_BIN" ] || die "dsh 尚未安装,请先运行: dsh-hmos install"
 }
 
+# 版本门控: 仅当「未安装」或「检测到新版」时才执行 npm 安装。
+# npm 的 reify 每次都会重解包整棵树(实测同版本也 "changed N packages"),
+# 会覆盖 4 处 patch、清掉 koffi/node-pty 构建产物、剪掉 extraneous 的
+# sharp-wasm32——所以版本相同时必须跳过 npm,保持真正幂等 + 离线可修复。
+# 有新版时 node_modules 被整体替换,patch 与原生产物作废,由 cmd_install
+# 第 4、5 步自动重打/重建(升级 dsh 只需重跑 install,无需 reinstall)。
+# 版本号直接读 package.json(不跑 CLI,损坏环境下也能拿到)。
+ensure_dsh_current() {
+    local inst_ver latest_ver new_ver
+    if [ -x "$DSH_BIN" ]; then
+        inst_ver="$(node -p "require('$DSH_PKG/package.json').version" 2>/dev/null || echo '?')"
+    else
+        inst_ver=""
+    fi
+    latest_ver="$(npm view @deepseek-ai/dsh@latest version --registry="$REGISTRY" 2>/dev/null || true)"
+    if [ -z "$inst_ver" ]; then
+        log "安装 @deepseek-ai/dsh 最新版 (npm, npmmirror 镜像)..."
+        npm install -g @deepseek-ai/dsh@latest --ignore-scripts --registry="$REGISTRY" || die "npm 安装 dsh 失败"
+        new_ver="$(node -p "require('$DSH_PKG/package.json').version" 2>/dev/null || echo '?')"
+        log "dsh 版本: 未安装 -> $new_ver"
+    elif [ -n "$latest_ver" ] && [ "$latest_ver" != "$inst_ver" ]; then
+        log "升级 @deepseek-ai/dsh: $inst_ver -> $latest_ver (npm, npmmirror 镜像)..."
+        npm install -g @deepseek-ai/dsh@latest --ignore-scripts --registry="$REGISTRY" || die "npm 安装 dsh 失败"
+        new_ver="$(node -p "require('$DSH_PKG/package.json').version" 2>/dev/null || echo "$latest_ver")"
+        log "dsh 版本: $inst_ver -> $new_ver"
+    elif [ -n "$latest_ver" ]; then
+        log "dsh 已是最新版: $inst_ver (跳过 npm)"
+    else
+        log "无法查询最新版本(可能离线),保留现装版本: $inst_ver (跳过 npm)"
+    fi
+}
+
 # ---------- install ----------
 
 cmd_install() {
@@ -77,19 +109,7 @@ cmd_install() {
     command -v python3 >/dev/null 2>&1 || die "python3 不可用,请检查 python@3.14 安装"
 
     # 2. dsh 本体(跳过构建脚本,后续手动构建原生模块)
-    #    每次都安装最新版: 版本未变时 npm 为无操作(幂等);检测到新版本时
-    #    node_modules 被整体替换,旧 patch 与原生产物全部作废,由第 4、5 步
-    #    自动重打/重建,无需单独的 reinstall 命令。
-    local old_ver new_ver
-    old_ver="$(dsh --version 2>/dev/null || echo '未安装')"
-    log "安装/升级 @deepseek-ai/dsh 到最新版 (npm, npmmirror 镜像)..."
-    npm install -g @deepseek-ai/dsh@latest --ignore-scripts --registry="$REGISTRY" || die "npm 安装 dsh 失败"
-    new_ver="$(dsh --version 2>/dev/null || echo '?')"
-    if [ "$old_ver" = "$new_ver" ]; then
-        log "dsh 版本: $new_ver(无变化)"
-    else
-        log "dsh 版本: $old_ver -> $new_ver"
-    fi
+    ensure_dsh_current
 
     # 3. 生成 koffi 构建用 toolchain 文件
     cat > "$TOOLCHAIN_FILE" <<'EOF'
@@ -492,7 +512,7 @@ cmd_uninstall() {
 # ---------- main ----------
 
 usage() {
-    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 check_platform

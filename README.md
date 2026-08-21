@@ -17,7 +17,7 @@
 `~/.harmonybrew/bin/dsh-hmos`,可直接使用:
 
 ```bash
-dsh-hmos install      # 检查 brew -> 安装依赖 -> 安装最新版 dsh -> 打 HarmonyOS patch -> 构建原生模块(幂等;有新版本时自动升级)
+dsh-hmos install      # 检查 brew -> 安装依赖 -> 比对/安装最新版 dsh -> 打 HarmonyOS patch -> 构建原生模块(版本门控幂等;有新版自动升级)
 dsh-hmos uninstall    # 卸载 dsh 及脚本状态(保留 ~/.dsh 用户数据)
 dsh-hmos start [flags]  # 后台启动 dsh web;flags 原样透传给 dsh web
 dsh-hmos status       # 查看所有后台实例运行状态
@@ -51,10 +51,14 @@ PID/日志文件(`~/.dsh-hmos/web-<port>.{pid,log}`);`status` 列出全部,
 已安装则自动完成依赖(node ohos-sdk cmake make ninja python@3.14 ripgrep)、npm 安装
 `@deepseek-ai/dsh`、四处 HarmonyOS 必需 patch(见下文第 4.2、7、8、10 节)以及
 node-pty / koffi / sharp 原生模块构建,最后做原生模块加载自检(失败时自动清理并重建原生模块再验一次)。重复执行安全(幂等)。
-`install` 每次都会安装最新版 `@deepseek-ai/dsh`(版本未变时 npm 无操作,幂等)。
-检测到新版本时 node_modules 被整体替换,4 处 patch 与原生产物全部作废,脚本会自动
-重打 patch 并重建 node-pty/koffi——升级 dsh 只需重跑 `dsh-hmos install`,
-不再需要单独的 `reinstall` 命令(该子命令已移除)。
+`install` 采用**版本门控**:先以轻量元数据查询(`npm view @latest version`,约 2s)与
+已装 `package.json` 版本比对——**未安装或有新版才执行 npm 安装**;已在最新版或
+离线查询失败时**跳过 npm**,保留现有安装。这一点很关键:npm 的 reify 每次都会
+重解包整棵树(同版本也会 `changed N packages`),若每次都重装,会覆盖 4 处 patch、
+清掉 koffi/node-pty 构建产物、剪掉 extraneous 的 sharp-wasm32,等于把"幂等快速
+重跑"变成"每次全量重装 5 分钟"。检测到新版安装后,node_modules 被整体替换,
+4 处 patch 与原生产物照旧由脚本自动重打/重建——**升级 dsh 只需重跑
+`dsh-hmos install`**,不再需要单独的 `reinstall` 命令(该子命令已移除)。
 `uninstall` 会先停服务、卸载 npm 包并清理脚本状态目录(`~/.dsh-hmos`),
 **保留** `~/.dsh`(会话/凭据/配置);彻底清除需手动删除 `~/.dsh`。
 
