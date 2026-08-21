@@ -2,8 +2,7 @@
 # dsh-hmos — DeepSeek Harness (dsh) 助手脚本(HarmonyOS / harmonybrew 专用)
 #
 # 用法:
-#   dsh-hmos install        安装/修复 dsh 及全部依赖(幂等,可重复执行)
-#   dsh-hmos reinstall      强制重装 dsh 并重建原生模块(升级 dsh 后使用)
+#   dsh-hmos install        安装/升级 dsh 到最新版,重打 patch 并重建原生模块(幂等,可重复执行)
 #   dsh-hmos uninstall      卸载 dsh 及脚本状态(保留 ~/.dsh 用户数据)
 #   dsh-hmos start [flags]  后台启动 dsh web,flags 原样透传给 dsh web
 #                           (如 --port 8080 / --host 0.0.0.0 / --trusted-host ...);
@@ -78,14 +77,18 @@ cmd_install() {
     command -v python3 >/dev/null 2>&1 || die "python3 不可用,请检查 python@3.14 安装"
 
     # 2. dsh 本体(跳过构建脚本,后续手动构建原生模块)
-    #    FORCE=1(reinstall): 无条件重装,用于升级 dsh 后重打补丁/重建原生模块
-    if [ "${FORCE:-0}" = 1 ] || [ ! -x "$DSH_BIN" ]; then
-        log "安装/重装 @deepseek-ai/dsh (npm, npmmirror 镜像)..."
-        npm install -g @deepseek-ai/dsh --ignore-scripts --registry="$REGISTRY" || die "npm 安装 dsh 失败"
-        # npm 会重建 node_modules,旧原生产物与旧 patch 全部作废
-        rm -rf "$DSH_PKG/node_modules/koffi/build" "$DSH_PKG/node_modules/node-pty/build"
+    #    每次都安装最新版: 版本未变时 npm 为无操作(幂等);检测到新版本时
+    #    node_modules 被整体替换,旧 patch 与原生产物全部作废,由第 4、5 步
+    #    自动重打/重建,无需单独的 reinstall 命令。
+    local old_ver new_ver
+    old_ver="$(dsh --version 2>/dev/null || echo '未安装')"
+    log "安装/升级 @deepseek-ai/dsh 到最新版 (npm, npmmirror 镜像)..."
+    npm install -g @deepseek-ai/dsh@latest --ignore-scripts --registry="$REGISTRY" || die "npm 安装 dsh 失败"
+    new_ver="$(dsh --version 2>/dev/null || echo '?')"
+    if [ "$old_ver" = "$new_ver" ]; then
+        log "dsh 版本: $new_ver(无变化)"
     else
-        log "dsh 已安装: $(dsh --version 2>/dev/null || echo '?')"
+        log "dsh 版本: $old_ver -> $new_ver"
     fi
 
     # 3. 生成 koffi 构建用 toolchain 文件
@@ -110,19 +113,28 @@ EOF
     install_sharp_wasm
 
     # 6. 原生模块加载自检(快速失败,避免带病运行)
-    verify_install
+    #    自检失败时,清掉可能"产物在但已损坏"的原生构建产物完整重建一次再验;
+    #    若仍失败才报错退出——避免残留坏产物时"反复重跑 install 也修不好"的死循环。
+    if ! verify_install; then
+        log "自检失败,清理并重建原生模块后重试一次..."
+        rm -rf "$DSH_PKG/node_modules/koffi/build" "$DSH_PKG/node_modules/node-pty/build"
+        build_node_pty
+        build_koffi
+        verify_install || die "原生模块重建后仍加载失败,请检查依赖/工具链后重试(详见上方错误)"
+    fi
 
     log "安装/修复完成。启动: dsh-hmos start"
 }
 
-# install/reinstall 末尾自检: 原生模块可加载 + ripgrep 解析正确
+# install 末尾自检: 原生模块可加载 + ripgrep 解析正确
+# 失败时返回非零(不直接退出),由 cmd_install 决定重建重试或报错
 verify_install() {
     log "自检: node-pty / koffi / sharp 加载与 ripgrep 解析..."
     ( cd "$DSH_PKG" && node -e "require('node-pty'); require('koffi'); require('sharp'); console.log('[dsh-hmos] 原生模块加载 OK')" ) \
-        || die "原生模块加载自检失败,请重新运行 dsh-hmos install 并查看错误"
+        || { echo "[dsh-hmos] 原生模块加载失败" >&2; return 1; }
     ( cd "$DSH_PKG" && node --input-type=module -e \
         "import('@vscode/ripgrep').then(m => console.log('[dsh-hmos] rgPath:', m.rgPath)).catch(e => { console.error(e.message); process.exit(1) })" ) \
-        || die "ripgrep 解析自检失败"
+        || { echo "[dsh-hmos] ripgrep 解析失败" >&2; return 1; }
 }
 
 # koffi: 禁用 POST_BUILD strip(hmdfs 的 dlopen 拒绝 stripped .node)
@@ -477,12 +489,6 @@ cmd_uninstall() {
     log "卸载完成。~/.dsh(会话/凭据/配置)已保留;如需彻底清除请手动删除 ~/.dsh"
 }
 
-# 强制重装: 升级 dsh 后 node_modules 被替换,4 处 patch 与原生模块产物全部作废,
-# 需 npm 重装 + 重新打 patch + 重建原生模块(与 install 流程相同,但强制刷新)
-cmd_reinstall() {
-    FORCE=1 cmd_install "$@"
-}
-
 # ---------- main ----------
 
 usage() {
@@ -493,7 +499,6 @@ check_platform
 
 case "${1:-help}" in
     install) shift; cmd_install "$@";;
-    reinstall) shift; cmd_reinstall "$@";;
     uninstall) shift; cmd_uninstall "$@";;
     start)   shift; cmd_start "$@";;
     status)  cmd_status "$@";;

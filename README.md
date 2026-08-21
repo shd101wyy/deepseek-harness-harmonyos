@@ -17,8 +17,7 @@
 `~/.harmonybrew/bin/dsh-hmos`,可直接使用:
 
 ```bash
-dsh-hmos install      # 检查 brew -> 安装依赖 -> 安装 dsh -> 打 HarmonyOS patch -> 构建原生模块(幂等)
-dsh-hmos reinstall    # 升级 dsh 后使用:npm 重装 + 重打 4 处 patch + 重建原生模块(强制刷新)
+dsh-hmos install      # 检查 brew -> 安装依赖 -> 安装最新版 dsh -> 打 HarmonyOS patch -> 构建原生模块(幂等;有新版本时自动升级)
 dsh-hmos uninstall    # 卸载 dsh 及脚本状态(保留 ~/.dsh 用户数据)
 dsh-hmos start [flags]  # 后台启动 dsh web;flags 原样透传给 dsh web
 dsh-hmos status       # 查看所有后台实例运行状态
@@ -51,9 +50,11 @@ PID/日志文件(`~/.dsh-hmos/web-<port>.{pid,log}`);`status` 列出全部,
 `install` 在 brew 未安装时会提示访问 https://harmonybrew.atomgit.com 并退出;
 已安装则自动完成依赖(node ohos-sdk cmake make ninja python@3.14 ripgrep)、npm 安装
 `@deepseek-ai/dsh`、四处 HarmonyOS 必需 patch(见下文第 4.2、7、8、10 节)以及
-node-pty / koffi / sharp 原生模块构建,最后做原生模块加载自检。重复执行安全(幂等)。
-**升级 dsh 后**(npm install -g 新版本)4 处 patch 与原生模块产物都会被覆盖,
-必须运行 `dsh-hmos reinstall`(强制 npm 重装 + 重打 patch + 重建 node-pty/koffi)。
+node-pty / koffi / sharp 原生模块构建,最后做原生模块加载自检(失败时自动清理并重建原生模块再验一次)。重复执行安全(幂等)。
+`install` 每次都会安装最新版 `@deepseek-ai/dsh`(版本未变时 npm 无操作,幂等)。
+检测到新版本时 node_modules 被整体替换,4 处 patch 与原生产物全部作废,脚本会自动
+重打 patch 并重建 node-pty/koffi——升级 dsh 只需重跑 `dsh-hmos install`,
+不再需要单独的 `reinstall` 命令(该子命令已移除)。
 `uninstall` 会先停服务、卸载 npm 包并清理脚本状态目录(`~/.dsh-hmos`),
 **保留** `~/.dsh`(会话/凭据/配置);彻底清除需手动删除 `~/.dsh`。
 
