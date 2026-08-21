@@ -9,6 +9,7 @@
 #                           不同 --port 可同时跑多个实例
 #   dsh-hmos status         查看所有后台实例运行状态
 #   dsh-hmos stop [--port N] 停止指定端口实例;不带参数停止全部
+#   dsh-hmos restart [--port N] 重启全部(或指定端口)实例,复用原启动参数
 #   dsh-hmos exec <args...> 透传执行 dsh 命令,如: dsh-hmos exec --help
 #   dsh-hmos help           显示本帮助
 #
@@ -362,6 +363,10 @@ cmd_start() {
     local log_file="$STATE_DIR/web-${port}.log"
     local url="http://127.0.0.1:${port}/"
 
+    # 记录本次启动参数,供 restart 原样复现(--host/--trusted-host 等);
+    # 端口已运行时也更新,保证 restart 用的是最近一次意图
+    echo "$*" > "$STATE_DIR/web-${port}.args"
+
     # 1) 端口已有服务 → 已在运行(唯一可靠信号)
     if port_up "$url"; then
         local old_pid=""
@@ -479,6 +484,85 @@ cmd_stop() {
     fi
 }
 
+# 重启: 不带参数重启全部正在运行的实例;--port N 只重启指定实例。
+# 重启复用启动时记录的原始参数(web-<port>.args,--host/--trusted-host 等),
+# 先停后启,并等待旧进程释放端口(最多 10s)再拉起,避免新实例绑定失败。
+cmd_restart() {
+    ensure_brew
+    ensure_installed
+    # 解析 --port(可选);空 = 重启全部
+    local only_port="" prev=""
+    for i in "$@"; do
+        if [ "$prev" = "--port" ]; then only_port="$i"; fi
+        case "$i" in
+            --port=*) only_port="${i#--port=}";;
+        esac
+        prev="$i"
+    done
+    case "$only_port" in
+        '') : ;;                       # 空 = 重启全部
+        *[!0-9]*) die "无效端口: '$only_port'(应为纯数字,如 --port 3080)";;
+    esac
+
+    # 收集目标端口(PID 文件存在且进程确属 dsh web,防 PID 复用误判)
+    local targets="" port
+    if [ -d "$STATE_DIR" ]; then
+        for pf in "$STATE_DIR"/web-*.pid; do
+            [ -f "$pf" ] || continue
+            port="${pf##*web-}"; port="${port%.pid}"
+            if [ -n "$only_port" ] && [ "$port" != "$only_port" ]; then continue; fi
+            if is_dsh_web_pid "$(cat "$pf" 2>/dev/null || true)"; then
+                case " $targets " in
+                    *" $port "*) ;;
+                    *) targets="$targets $port" ;;
+                esac
+            fi
+        done
+    fi
+    if [ -z "$targets" ]; then
+        if [ -n "$only_port" ]; then
+            log "端口 $only_port 未在运行,无需重启"
+        else
+            log "没有正在运行的实例,无需重启"
+        fi
+        return 0
+    fi
+
+    local any_fail=0 p
+    for p in $targets; do
+        log "重启 dsh web (port $p)..."
+        cmd_stop --port "$p" >/dev/null 2>&1 || true
+        # 等待旧进程退出/端口释放(最多 10s)
+        local waited=0
+        while [ "$waited" -lt 10 ] && port_up "http://127.0.0.1:${p}/"; do
+            sleep 1
+            waited=$((waited + 1))
+        done
+        if port_up "http://127.0.0.1:${p}/"; then
+            echo "[dsh-hmos] 端口 $p 未能在 10 秒内释放,已放弃重启(可先 stop 再 start)" >&2
+            any_fail=1
+            continue
+        fi
+        # 复用原启动参数;无记录(旧版本启动的实例)则退化为默认启动该端口
+        local args="--port $p"
+        if [ -f "$STATE_DIR/web-${p}.args" ] && [ -s "$STATE_DIR/web-${p}.args" ]; then
+            args="$(cat "$STATE_DIR/web-${p}.args")"
+        fi
+        # shellcheck disable=SC2086
+        if cmd_start $args; then
+            log "重启完成 (port $p)"
+        else
+            echo "[dsh-hmos] 重启失败 (port $p),请查看日志: $STATE_DIR/web-${p}.log" >&2
+            any_fail=1
+        fi
+    done
+    if [ "$any_fail" -eq 0 ]; then
+        log "全部重启完成:$targets"
+        return 0
+    fi
+    return 1
+}
+
 # ---------- exec ----------
 
 cmd_exec() {
@@ -512,7 +596,7 @@ cmd_uninstall() {
 # ---------- main ----------
 
 usage() {
-    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 check_platform
@@ -523,6 +607,7 @@ case "${1:-help}" in
     start)   shift; cmd_start "$@";;
     status)  cmd_status "$@";;
     stop)    shift; cmd_stop "$@";;
+    restart) shift; cmd_restart "$@";;
     exec)    shift; cmd_exec "$@";;
     help|-h|--help) usage;;
     *) echo "未知命令: ${1:-}"; usage; exit 1;;

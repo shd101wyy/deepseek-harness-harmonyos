@@ -22,6 +22,7 @@ dsh-hmos uninstall    # 卸载 dsh 及脚本状态(保留 ~/.dsh 用户数据)
 dsh-hmos start [flags]  # 后台启动 dsh web;flags 原样透传给 dsh web
 dsh-hmos status       # 查看所有后台实例运行状态
 dsh-hmos stop [--port N]  # 停止指定端口实例;不带参数停止全部
+dsh-hmos restart [--port N]  # 重启全部(或指定端口)实例,复用原启动参数
 dsh-hmos exec ...     # 透传运行 dsh 命令,如: dsh-hmos exec --help
 dsh-hmos help         # 帮助
 ```
@@ -46,6 +47,12 @@ PID/日志文件(`~/.dsh-hmos/web-<port>.{pid,log}`);`status` 列出全部,
 - `status` 能正确区分"运行中 / 启动中 / 未运行",残留 PID 文件自动清理
 - `start` 不会误报"已在运行",会正常拉起服务
 - `stop` 不会误杀 PID 被系统复用的无关进程
+
+`restart` 重启正在运行的实例(不带参数 = 全部;`--port N` = 指定端口)。
+它会复用启动时记录在 `~/.dsh-hmos/web-<port>.args` 的原始参数
+(`--host`/`--trusted-host` 等),先停后启,并等待旧进程释放端口(最多
+10 秒)再拉起,避免新实例端口绑定失败;早期版本启动的实例(无 `.args`
+记录)退化为以默认参数重启该端口。
 
 `install` 在 brew 未安装时会提示访问 https://harmonybrew.atomgit.com 并退出;
 已安装则自动完成依赖(node ohos-sdk cmake make ninja python@3.14 ripgrep)、npm 安装
